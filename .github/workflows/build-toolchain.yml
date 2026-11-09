@@ -1,0 +1,83 @@
+name: Build toolchain
+
+# Run it by hand: Actions tab > Build toolchain > Run workflow.
+# Result: an artifact named "toolchain" (a zip) with android.jar, ecj.jar,
+# d8.jar and aapt2 for the Android Studio app (menu > Import toolchain).
+
+on:
+  workflow_dispatch:
+
+env:
+  ANDROID_API: "34"
+  BUILD_TOOLS: "34.0.0"
+  ECJ_VERSION: "4.6.1"
+  AAPT2_URL: "https://github.com/lzhiyong/android-sdk-tools/releases/download/35.0.2/android-sdk-tools-static-aarch64.zip"
+
+jobs:
+  toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install android.jar and d8 (official Android SDK)
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-${ANDROID_API}" "build-tools;${BUILD_TOOLS}"
+
+      - name: Build the toolchain files
+        run: |
+          set -euxo pipefail
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          W="$PWD/work"
+          OUT="$PWD/toolchain"
+          mkdir -p "$W" "$OUT"
+
+          # 1. android.jar
+          cp "$SDK/platforms/android-${ANDROID_API}/android.jar" "$OUT/android.jar"
+
+          # 2. sources of ecj (Maven Central) and d8 (Android build-tools)
+          curl -fL -o "$W/ecj-src.jar" \
+            "https://repo1.maven.org/maven2/org/eclipse/jdt/core/compiler/ecj/${ECJ_VERSION}/ecj-${ECJ_VERSION}.jar"
+          cp "$SDK/build-tools/${BUILD_TOOLS}/lib/d8.jar" "$W/d8-src.jar"
+
+          # 3. convert both to dex so the phone can run them
+          D8="java -cp $W/d8-src.jar com.android.tools.r8.D8"
+          $D8 --lib "$OUT/android.jar" --min-api 21 --output "$OUT/ecj.jar" "$W/ecj-src.jar"
+          $D8 --lib "$OUT/android.jar" --min-api 21 --output "$OUT/d8.jar" "$W/d8-src.jar"
+
+          # 4. d8 drops resource files (ecj needs its messages.properties)
+          restore() {
+            rm -rf "$W/x" && mkdir "$W/x"
+            (cd "$W/x" && unzip -q "$1" \
+              && zip -qr "$2" . -x '*.class' 'META-INF/*.SF' 'META-INF/*.RSA' \
+                 'META-INF/*.DSA' 'META-INF/MANIFEST.MF') || true
+          }
+          restore "$W/ecj-src.jar" "$OUT/ecj.jar"
+          restore "$W/d8-src.jar" "$OUT/d8.jar"
+
+          # 5. aapt2 built for Android (aarch64, static)
+          curl -fL -o "$W/tools.zip" "$AAPT2_URL"
+          unzip -q "$W/tools.zip" -d "$W/tools"
+          A="$(find "$W/tools" -type f -name aapt2 | head -1)"
+          test -n "$A"
+          cp "$A" "$OUT/aapt2-arm64-v8a"
+          cp "$A" "$OUT/libaapt2.so"
+
+          # 6. checks
+          unzip -l "$OUT/ecj.jar" > "$W/ecj-list.txt"
+          grep -c "classes.*dex" "$W/ecj-list.txt"
+          grep -c "messages.properties" "$W/ecj-list.txt"
+          ls -l "$OUT"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolchain
+          path: toolchain/*
+          if-no-files-found: error
